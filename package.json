@@ -1,0 +1,22 @@
+{
+  "name": "polymarket-copy",
+  "version": "1.0.0",
+  "description": "Polymarket Copy Trade Tool - Auto copy trades from any trader",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon --ignore 'data/*.json' src/index.js"
+  },
+  "keywords": ["polymarket", "copy-trade", "crypto"],
+  "author": "direkturcrypto",
+  "license": "ISC",
+  "dependencies": {
+    "@polymarket/clob-client": "^4.7.3",
+    "dotenv": "^16.4.7",
+    "ethers": "^5.8.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  }
+}
