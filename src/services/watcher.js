@@ -57,36 +57,41 @@ export async function checkNewTrades() {
     const newTrades = [];
 
     for (const activity of activities) {
-        // Skip already processed
-        const tradeId = activity.id || activity.transaction_hash || `${activity.timestamp}_${activity.asset}`;
+        // Data API: type = "TRADE" always, direction is in "side" (BUY / SELL)
+        // Unique dedup key: txHash + asset + side (one tx can have multiple token trades)
+        const tradeId = activity.transactionHash
+            ? `${activity.transactionHash}_${activity.asset}_${activity.side}`
+            : `${activity.timestamp}_${activity.asset}_${activity.side}`;
+
         if (processed.tradeIds.includes(tradeId)) {
             continue;
         }
 
-        // Only process filled trades (buys and sells)
-        const type = activity.type?.toUpperCase();
-        if (!['BUY', 'SELL'].includes(type)) {
-            // Mark non-buy/sell as processed so we don't re-check
+        // Only process TRADE type with BUY or SELL side
+        const actType = (activity.type || '').toUpperCase();
+        const side = (activity.side || '').toUpperCase();
+
+        if (actType !== 'TRADE' || !['BUY', 'SELL'].includes(side)) {
             markTradeProcessed(tradeId);
             continue;
         }
 
-        // Extract trade info
         const trade = {
             id: tradeId,
-            type, // BUY or SELL
-            tokenId: activity.asset || activity.token_id || '',
-            conditionId: activity.condition_id || activity.conditionId || '',
-            market: activity.title || activity.question || activity.market || '',
+            type: side,                                                    // BUY or SELL
+            tokenId: activity.asset || '',
+            conditionId: activity.conditionId || '',
+            market: activity.title || activity.question || '',
             price: parseFloat(activity.price || '0'),
-            size: parseFloat(activity.size || activity.amount || '0'),
-            side: activity.side || type,
-            timestamp: activity.timestamp || activity.created_at || new Date().toISOString(),
+            size: parseFloat(activity.usdcSize || '0'),                   // USDC value
+            shares: parseFloat(activity.size || '0'),                   // token shares
+            side,
             outcome: activity.outcome || '',
-            proxyWalletAddress: activity.proxyWalletAddress || '',
+            outcomeIndex: activity.outcomeIndex ?? null,
+            timestamp: activity.timestamp || Date.now() / 1000,
+            txHash: activity.transactionHash || '',
         };
 
-        // Need tokenId to trade
         if (!trade.tokenId) {
             logger.warn(`Skipping trade without tokenId: ${tradeId}`);
             markTradeProcessed(tradeId);
@@ -98,6 +103,7 @@ export async function checkNewTrades() {
 
     return newTrades;
 }
+
 
 /**
  * Mark trade as processed after handling

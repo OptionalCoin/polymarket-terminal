@@ -4,19 +4,22 @@ import { getClient, getUsdcBalance } from './client.js';
 import { hasPosition, addPosition, getPosition, updatePosition, removePosition } from './position.js';
 import { fetchMarketByTokenId } from './watcher.js';
 import { placeAutoSell } from './autoSell.js';
+import { recordSimBuy } from '../utils/simStats.js';
 import logger from '../utils/logger.js';
 
 /**
- * Calculate trade size based on settings
- * @param {number} traderSize - Trader's trade size in USDC
- * @returns {number} Our trade size in USDC
+ * Calculate trade size for our entry — independent of the individual fill event.
+ *
+ * Limit orders can be filled in many small chunks; using the event's fill size
+ * would give inconsistent (often sub-minimum) results.
+ *
+ * SIZE_MODE=percentage → SIZE_PERCENT% of MAX_POSITION_SIZE per market
+ * SIZE_MODE=balance    → SIZE_PERCENT% of our current USDC.e balance
  */
-async function calculateTradeSize(traderSize) {
+async function calculateTradeSize() {
     if (config.sizeMode === 'percentage') {
-        // % of trader's trade size
-        return traderSize * (config.sizePercent / 100);
+        return config.maxPositionSize * (config.sizePercent / 100);
     } else if (config.sizeMode === 'balance') {
-        // % of our own balance
         const balance = await getUsdcBalance();
         return balance * (config.sizePercent / 100);
     }
@@ -61,14 +64,32 @@ async function getMarketOptions(tokenId) {
 export async function executeBuy(trade) {
     const { tokenId, conditionId, market, price, size } = trade;
 
-    // Check if already have position for this market
-    if (hasPosition(conditionId)) {
-        logger.warn(`Already have position for: ${market || conditionId}. Skipping buy.`);
-        return;
+    // Get market options first to resolve conditionId
+    const marketOpts = await getMarketOptions(tokenId);
+    const effectiveConditionId = conditionId || marketOpts.conditionId;
+
+    // Check existing position and max position size cap
+    const existingPos = getPosition(effectiveConditionId);
+    if (existingPos) {
+        const spent = existingPos.totalCost || 0;
+        if (spent >= config.maxPositionSize) {
+            logger.warn(`Max position $${config.maxPositionSize} reached for: ${market || effectiveConditionId} (spent $${spent.toFixed(2)}). Skipping.`);
+            return;
+        }
+        logger.info(`Adding to existing position (spent $${spent.toFixed(2)} / $${config.maxPositionSize})`);
     }
 
-    // Calculate our trade size
-    const tradeSize = await calculateTradeSize(size * price); // trader's USDC amount
+    // Calculate our trade size (independent of individual fill event)
+    let tradeSize = await calculateTradeSize();
+
+    // Cap so we don't exceed maxPositionSize
+    if (existingPos) {
+        const remaining = config.maxPositionSize - (existingPos.totalCost || 0);
+        tradeSize = Math.min(tradeSize, remaining);
+    } else {
+        tradeSize = Math.min(tradeSize, config.maxPositionSize);
+    }
+
     if (tradeSize < config.minTradeSize) {
         logger.warn(`Trade size $${tradeSize.toFixed(2)} below minimum $${config.minTradeSize}. Skipping.`);
         return;
@@ -81,30 +102,32 @@ export async function executeBuy(trade) {
         return;
     }
 
-    // Get market options
-    const marketOpts = await getMarketOptions(tokenId);
-    const effectiveConditionId = conditionId || marketOpts.conditionId;
-
-    // Double check no position exists
-    if (effectiveConditionId && hasPosition(effectiveConditionId)) {
-        logger.warn(`Already have position for: ${market || effectiveConditionId}. Skipping buy.`);
-        return;
-    }
-
     logger.trade(`BUY ${market || tokenId} | Size: $${tradeSize.toFixed(2)} | Trader price: ${price}`);
 
     if (config.dryRun) {
-        logger.info('[DRY RUN] Would place market buy order');
-        // Still record position in dry run for testing
-        addPosition({
-            conditionId: effectiveConditionId,
-            tokenId,
-            market: market || marketOpts.question || tokenId,
-            shares: tradeSize / price,
-            avgBuyPrice: price,
-            totalCost: tradeSize,
-            outcome: trade.outcome,
-        });
+        logger.trade(`[SIM] BUY ${market || tokenId} | $${tradeSize.toFixed(2)} @ $${price} | outcome: ${trade.outcome || '?'}`);
+        const dryShares = tradeSize / price;
+        if (existingPos) {
+            const newShares = existingPos.shares + dryShares;
+            const newTotalCost = existingPos.totalCost + tradeSize;
+            updatePosition(effectiveConditionId, {
+                shares: newShares,
+                avgBuyPrice: newTotalCost / newShares,
+                totalCost: newTotalCost,
+            });
+            logger.info(`[SIM] Position accumulated: $${newTotalCost.toFixed(2)} / $${config.maxPositionSize}`);
+        } else {
+            addPosition({
+                conditionId: effectiveConditionId,
+                tokenId,
+                market: market || marketOpts.question || tokenId,
+                shares: dryShares,
+                avgBuyPrice: price,
+                totalCost: tradeSize,
+                outcome: trade.outcome,
+            });
+        }
+        recordSimBuy();
         return;
     }
 
@@ -172,23 +195,36 @@ export async function executeBuy(trade) {
         return;
     }
 
-    // Calculate avg buy price
-    const avgBuyPrice = totalSharesFilled > 0 ? totalCostFilled / totalSharesFilled : price;
+    // Calculate avg buy price for this fill
+    const fillAvgPrice = totalSharesFilled > 0 ? totalCostFilled / totalSharesFilled : price;
 
-    // Record position
-    addPosition({
-        conditionId: effectiveConditionId,
-        tokenId,
-        market: market || marketOpts.question || tokenId,
-        shares: totalSharesFilled,
-        avgBuyPrice,
-        totalCost: totalCostFilled,
-        outcome: trade.outcome,
-    });
+    if (existingPos) {
+        // Accumulate into existing position (weighted avg price)
+        const newShares = existingPos.shares + totalSharesFilled;
+        const newTotalCost = existingPos.totalCost + totalCostFilled;
+        const newAvgBuyPrice = newTotalCost / newShares;
+        updatePosition(effectiveConditionId, {
+            shares: newShares,
+            avgBuyPrice: newAvgBuyPrice,
+            totalCost: newTotalCost,
+        });
+        logger.success(`Position updated: ${existingPos.market} | total $${newTotalCost.toFixed(2)} / $${config.maxPositionSize}`);
+    } else {
+        // New position
+        addPosition({
+            conditionId: effectiveConditionId,
+            tokenId,
+            market: market || marketOpts.question || tokenId,
+            shares: totalSharesFilled,
+            avgBuyPrice: fillAvgPrice,
+            totalCost: totalCostFilled,
+            outcome: trade.outcome,
+        });
 
-    // Auto-sell if enabled
-    if (config.autoSellEnabled) {
-        await placeAutoSell(effectiveConditionId, tokenId, totalSharesFilled, avgBuyPrice, marketOpts);
+        // Auto-sell only on initial entry, not on accumulation
+        if (config.autoSellEnabled) {
+            await placeAutoSell(effectiveConditionId, tokenId, totalSharesFilled, fillAvgPrice, marketOpts);
+        }
     }
 }
 

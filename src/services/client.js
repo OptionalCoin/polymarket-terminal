@@ -14,8 +14,8 @@ export async function initClient() {
     logger.info('Initializing Polymarket CLOB client...');
 
     signer = new Wallet(config.privateKey);
-    const walletAddress = signer.address;
-    logger.info(`Wallet address: ${walletAddress}`);
+    logger.info(`EOA (signer)  : ${signer.address}`);
+    logger.info(`Proxy wallet  : ${config.proxyWallet}`);
 
     // Step 1: Create temp client to derive API credentials
     let apiCreds;
@@ -33,13 +33,14 @@ export async function initClient() {
     }
 
     // Step 2: Initialize full trading client
+    // proxyWallet = funder address (where USDC.e is held)
     clobClient = new ClobClient(
         config.clobHost,
         config.chainId,
         signer,
         apiCreds,
-        0, // Signature type: 0 = EOA
-        config.walletAddress || walletAddress, // Funder address
+        2, // Signature type: 2 = POLY_PROXY (EOA signs on behalf of proxy wallet)
+        config.proxyWallet, // Funder = proxy wallet (deposit USDC.e here)
     );
 
     logger.success('CLOB client initialized');
@@ -67,15 +68,23 @@ export function getSigner() {
 }
 
 /**
- * Get USDC.e balance on Polygon for the wallet
+ * Get a working Polygon provider using RPC from config
+ */
+export async function getPolygonProvider() {
+    const { ethers } = await import('ethers');
+    const provider = new ethers.providers.JsonRpcProvider(config.polygonRpcUrl);
+    return provider;
+}
+
+/**
+ * Get USDC.e balance of the proxy wallet on Polygon
  */
 export async function getUsdcBalance() {
     const { ethers } = await import('ethers');
-    const provider = new ethers.providers.JsonRpcProvider('https://polygon-rpc.com');
+    const provider = await getPolygonProvider();
     const usdcAddress = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC.e on Polygon
     const abi = ['function balanceOf(address) view returns (uint256)'];
     const usdc = new ethers.Contract(usdcAddress, abi, provider);
-    const funderAddress = config.walletAddress || signer.address;
-    const balance = await usdc.balanceOf(funderAddress);
+    const balance = await usdc.balanceOf(config.proxyWallet);
     return parseFloat(ethers.utils.formatUnits(balance, 6));
 }
