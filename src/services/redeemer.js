@@ -140,17 +140,22 @@ export async function checkAndRedeemPositions() {
 
     for (const position of positions) {
         try {
-            // 1. Check via Gamma API
+            // 1. Quick check via Gamma API (low cost)
             const resolution = await checkMarketResolution(position.conditionId);
-            const isResolved = resolution?.resolved;
+            const apiResolved = resolution?.resolved;
 
-            if (!isResolved) {
-                // 2. Fallback: on-chain check
-                const onChain = await checkOnChainPayout(position.conditionId);
-                if (!onChain.resolved) continue;
-                logger.info(`Market resolved on-chain: ${position.market}`);
-            } else {
-                logger.info(`Market resolved: ${position.market}`);
+            if (!apiResolved) continue; // Not resolved yet — check again next interval
+
+            logger.info(`Market resolved via API: ${position.market}`);
+
+            // 2. ALWAYS verify on-chain payout before calling redeemPositions.
+            //    Gamma API can report "resolved" before payoutDenominator is written
+            //    on-chain. Calling redeemPositions with payoutDenominator == 0 causes
+            //    the contract to revert → gas estimation failure.
+            const onChain = await checkOnChainPayout(position.conditionId);
+            if (!onChain.resolved) {
+                logger.info(`On-chain payout not set yet for ${position.market} — will retry next interval`);
+                continue;
             }
 
             // 3. Simulate or execute real redeem

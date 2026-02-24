@@ -11,6 +11,11 @@ import logger from '../utils/logger.js';
 
 const CTF_ABI_BALANCE = ['function balanceOf(address account, uint256 id) view returns (uint256)'];
 
+// Per-market buy queue: prevents concurrent buys for the same market.
+// Each conditionId maps to the Promise tail of its queue so calls are
+// chained — the next buy only starts after the previous one finishes.
+const _buyQueue = new Map();
+
 /**
  * Fetch the actual on-chain ERC-1155 balance for a conditional token.
  * Returns shares as a plain float (6-decimal conversion).
@@ -81,15 +86,40 @@ async function getMarketOptions(tokenId) {
 }
 
 /**
- * Execute a BUY trade (copy trader's buy)
- * @param {Object} trade - Trade info from watcher
+ * Execute a BUY trade (copy trader's buy).
+ * Calls are serialized per market — concurrent events for the same market
+ * are queued and processed one at a time to prevent duplicate positions.
  */
-export async function executeBuy(trade) {
-    const { tokenId, conditionId, market, price, size } = trade;
+export function executeBuy(trade) {
+    const { tokenId, conditionId } = trade;
 
-    // Get market options first to resolve conditionId + end time
-    const marketOpts = await getMarketOptions(tokenId);
-    const effectiveConditionId = conditionId || marketOpts.conditionId;
+    // Resolve conditionId to use as queue key.
+    // getMarketOptions is a read-only fetch — safe to run outside the queue.
+    const queued = getMarketOptions(tokenId).then((marketOpts) => {
+        const effectiveConditionId = conditionId || marketOpts.conditionId;
+
+        // Chain this buy after the previous one for the same market
+        const prev = _buyQueue.get(effectiveConditionId) ?? Promise.resolve();
+        const current = prev
+            .then(() => _doExecuteBuy(trade, marketOpts, effectiveConditionId))
+            .finally(() => {
+                // Remove from map only if we're still the tail (no newer call queued)
+                if (_buyQueue.get(effectiveConditionId) === current) {
+                    _buyQueue.delete(effectiveConditionId);
+                }
+            });
+        _buyQueue.set(effectiveConditionId, current);
+        return current;
+    });
+
+    return queued;
+}
+
+/**
+ * Internal: the actual buy logic, guaranteed to run serially per market.
+ */
+async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
+    const { tokenId, conditionId, market, price, size } = trade;
 
     // ── Market expiry guard ────────────────────────────────────────────────────
     if (!marketOpts.active || !marketOpts.acceptingOrders) {
@@ -132,8 +162,11 @@ export async function executeBuy(trade) {
         tradeSize = Math.min(tradeSize, config.maxPositionSize);
     }
 
-    if (tradeSize < config.minTradeSize) {
-        logger.warn(`Trade size $${tradeSize.toFixed(2)} below minimum $${config.minTradeSize}. Skipping.`);
+    // Polymarket enforces a hard $1 minimum per market order.
+    const CLOB_MIN_ORDER_USDC = 1;
+    const effectiveMin = Math.max(config.minTradeSize, CLOB_MIN_ORDER_USDC);
+    if (tradeSize < effectiveMin) {
+        logger.warn(`Trade size $${tradeSize.toFixed(2)} below $${effectiveMin} minimum — skipping buy`);
         return;
     }
 
@@ -179,14 +212,11 @@ export async function executeBuy(trade) {
     let totalSharesFilled = 0;
     let totalCostFilled = 0;
 
-    // Polymarket enforces a hard $1 minimum per market order.
-    const CLOB_MIN_ORDER_USDC = 1;
-
     for (let attempt = 1; attempt <= config.maxRetries; attempt++) {
         try {
             const remainingAmount = tradeSize - totalCostFilled;
-            if (remainingAmount < Math.max(config.minTradeSize, CLOB_MIN_ORDER_USDC)) {
-                if (remainingAmount > 0) logger.info(`Remaining $${remainingAmount.toFixed(2)} below $1 minimum — stopping`);
+            if (remainingAmount < effectiveMin) {
+                if (remainingAmount > 0) logger.info(`Remaining $${remainingAmount.toFixed(2)} below $${effectiveMin} minimum — stopping`);
                 break;
             }
 
@@ -216,7 +246,7 @@ export async function executeBuy(trade) {
                     totalCostFilled   += costFilled || (sharesFilled * price);
                     filled = true;
                     // If remainder is below $1 minimum, stop; otherwise loop for partial fill
-                    if (tradeSize - totalCostFilled < Math.max(config.minTradeSize, CLOB_MIN_ORDER_USDC)) break;
+                    if (tradeSize - totalCostFilled < effectiveMin) break;
                 } else {
                     logger.warn(`No liquidity — FAK filled 0 shares (attempt ${attempt})`);
                 }
