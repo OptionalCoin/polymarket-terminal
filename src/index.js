@@ -11,6 +11,7 @@ import logger from './utils/logger.js';
 // ── Dashboard init (before any log output) ────────────────────────────────────
 initDashboard();
 logger.setOutput(appendLog);
+logger.interceptConsole(); // strip auth headers from CLOB client axios error dumps
 
 // ── Handle a trade event from WebSocket ───────────────────────────────────────
 async function handleTrade(trade) {

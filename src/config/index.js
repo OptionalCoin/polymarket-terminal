@@ -46,6 +46,9 @@ const config = {
   maxRetries: 5,
   retryDelay: 3000,
 
+  // Skip buy if market closes within this many seconds (default 5 minutes)
+  minMarketTimeLeft: parseInt(process.env.MIN_MARKET_TIME_LEFT || '300', 10),
+
   // ── Market Maker ──────────────────────────────────────────────
   mmAssets:        (process.env.MM_ASSETS || 'btc')
                      .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),

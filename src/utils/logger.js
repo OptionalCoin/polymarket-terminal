@@ -22,6 +22,26 @@ const B = {
 
 let outputFn = null; // When set, all log goes here (blessed dashboard mode)
 
+/**
+ * Sanitize a CLOB client console message.
+ * Strips the full axios config (which may contain auth headers) and returns
+ * only the HTTP status code + API error message.
+ */
+function sanitizeClobMessage(raw) {
+    if (!raw.includes('[CLOB Client]')) return raw;
+    try {
+        const jsonStart = raw.indexOf('{');
+        if (jsonStart === -1) return raw;
+        const parsed = JSON.parse(raw.slice(jsonStart));
+        const status  = parsed.status  || '';
+        const errMsg  = parsed.data?.error || parsed.statusText || 'unknown error';
+        const prefix  = raw.slice(0, jsonStart).trim();
+        return `${prefix}: ${status} — ${errMsg}`;
+    } catch {
+        return raw;
+    }
+}
+
 function ts() {
     return new Date().toISOString().replace('T', ' ').substring(0, 19);
 }
@@ -54,6 +74,25 @@ const logger = {
     /** Call once after initDashboard() to redirect all logs to the TUI */
     setOutput(fn) {
         outputFn = fn;
+    },
+
+    /**
+     * Override console.error and console.log globally so that the CLOB client's
+     * internal axios error dumps are sanitized (no auth headers / full config).
+     * Call this once at startup, before any CLOB requests.
+     */
+    interceptConsole() {
+        const handle = (originalFn, logFn) => (...args) => {
+            const raw = args.map((a) => (a && typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+            const sanitized = sanitizeClobMessage(raw);
+            if (sanitized !== raw || raw.includes('[CLOB Client]')) {
+                logFn(sanitized);
+            } else {
+                originalFn(...args);
+            }
+        };
+        console.error = handle(console.error.bind(console), logger.error);
+        console.warn  = handle(console.warn.bind(console),  logger.warn);
     },
 };
 

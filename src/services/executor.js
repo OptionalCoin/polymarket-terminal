@@ -36,10 +36,13 @@ async function getMarketOptions(tokenId) {
         const marketInfo = await fetchMarketByTokenId(tokenId);
         if (marketInfo) {
             return {
-                tickSize: String(marketInfo.minimum_tick_size || '0.01'),
-                negRisk: marketInfo.neg_risk || false,
+                tickSize:   String(marketInfo.minimum_tick_size || '0.01'),
+                negRisk:    marketInfo.neg_risk || false,
                 conditionId: marketInfo.condition_id || '',
-                question: marketInfo.question || '',
+                question:   marketInfo.question || '',
+                endDateIso: marketInfo.end_date_iso || marketInfo.game_start_time || null,
+                active:     marketInfo.active !== false,
+                acceptingOrders: marketInfo.accepting_orders !== false,
             };
         }
     } catch (err) {
@@ -50,10 +53,10 @@ async function getMarketOptions(tokenId) {
     try {
         const tickSize = await client.getTickSize(tokenId);
         const negRisk = await client.getNegRisk(tokenId);
-        return { tickSize: String(tickSize), negRisk, conditionId: '', question: '' };
+        return { tickSize: String(tickSize), negRisk, conditionId: '', question: '', endDateIso: null, active: true, acceptingOrders: true };
     } catch (err) {
         logger.warn('Failed to get tick size from SDK, using default 0.01');
-        return { tickSize: '0.01', negRisk: false, conditionId: '', question: '' };
+        return { tickSize: '0.01', negRisk: false, conditionId: '', question: '', endDateIso: null, active: true, acceptingOrders: true };
     }
 }
 
@@ -64,9 +67,28 @@ async function getMarketOptions(tokenId) {
 export async function executeBuy(trade) {
     const { tokenId, conditionId, market, price, size } = trade;
 
-    // Get market options first to resolve conditionId
+    // Get market options first to resolve conditionId + end time
     const marketOpts = await getMarketOptions(tokenId);
     const effectiveConditionId = conditionId || marketOpts.conditionId;
+
+    // ── Market expiry guard ────────────────────────────────────────────────────
+    if (!marketOpts.active || !marketOpts.acceptingOrders) {
+        logger.warn(`Market closed/not accepting orders: ${market || effectiveConditionId} — skipping buy`);
+        return;
+    }
+    if (marketOpts.endDateIso) {
+        const secsLeft = (new Date(marketOpts.endDateIso).getTime() - Date.now()) / 1000;
+        if (secsLeft < config.minMarketTimeLeft) {
+            const minsLeft = Math.max(0, Math.floor(secsLeft / 60));
+            const sLeft    = Math.max(0, Math.floor(secsLeft % 60));
+            logger.warn(
+                `Market expires in ${minsLeft}m ${sLeft}s — below MIN_MARKET_TIME_LEFT ` +
+                `(${config.minMarketTimeLeft}s). Skipping buy: ${market || effectiveConditionId}`,
+            );
+            return;
+        }
+    }
+    // ──────────────────────────────────────────────────────────────────────────
 
     // Check existing position and max position size cap
     const existingPos = getPosition(effectiveConditionId);
@@ -131,7 +153,7 @@ export async function executeBuy(trade) {
         return;
     }
 
-    // Place market order with retries
+    // Place market order (FAK) with retries
     const client = getClient();
     let filled = false;
     let totalSharesFilled = 0;
@@ -144,47 +166,41 @@ export async function executeBuy(trade) {
 
             logger.info(`Buy attempt ${attempt}/${config.maxRetries} | Amount: $${remainingAmount.toFixed(2)}`);
 
-            // Use FAK (fill-and-kill) to get what's available, then retry remainder
             const response = await client.createAndPostMarketOrder(
                 {
                     tokenID: tokenId,
                     side: Side.BUY,
                     amount: remainingAmount,
-                    price: Math.min(price * 1.05, 0.99), // 5% slippage allowance, max 0.99
+                    price: Math.min(price * 1.02, 0.99), // 2% slippage, max 0.99
                 },
                 {
                     tickSize: marketOpts.tickSize,
                     negRisk: marketOpts.negRisk,
                 },
-                OrderType.FOK,
+                OrderType.FAK, // Fill-and-Kill: takes what's available, no full-fill requirement
             );
 
             if (response && response.success) {
-                logger.success(`Order placed: ${response.orderID} | Status: ${response.status}`);
+                const sharesFilled = parseFloat(response.takingAmount || '0');
+                const costFilled   = parseFloat(response.makingAmount || '0');
 
-                // Check if fully filled by trying to get trade info
-                const takingAmount = parseFloat(response.takingAmount || '0');
-                const makingAmount = parseFloat(response.makingAmount || '0');
-
-                if (takingAmount > 0 || makingAmount > 0) {
-                    totalSharesFilled += takingAmount || (remainingAmount / price);
-                    totalCostFilled += makingAmount || remainingAmount;
+                if (sharesFilled > 0) {
+                    logger.success(`Order filled: ${response.orderID} | ${sharesFilled.toFixed(4)} shares @ ~$${(costFilled / sharesFilled).toFixed(4)}`);
+                    totalSharesFilled += sharesFilled;
+                    totalCostFilled   += costFilled || (sharesFilled * price);
                     filled = true;
-                    break; // FOK either fills fully or cancels
+                    // If remainder is below minimum, stop; otherwise loop for partial fill
+                    if (tradeSize - totalCostFilled < config.minTradeSize) break;
                 } else {
-                    filled = true;
-                    totalSharesFilled = tradeSize / price;
-                    totalCostFilled = tradeSize;
-                    break;
+                    logger.warn(`No liquidity — FAK filled 0 shares (attempt ${attempt})`);
                 }
             } else {
-                logger.warn(`Order not filled. Error: ${response?.errorMsg || 'Unknown'}`);
+                logger.warn(`Order rejected: ${response?.errorMsg || 'unknown'}`);
             }
         } catch (err) {
-            logger.error(`Buy attempt ${attempt} failed:`, err.message);
+            logger.error(`Buy attempt ${attempt} failed: ${err.message}`);
         }
 
-        // Wait before retry
         if (attempt < config.maxRetries) {
             await new Promise((r) => setTimeout(r, config.retryDelay));
         }
@@ -286,7 +302,7 @@ export async function executeSell(trade) {
     for (let attempt = 1; attempt <= config.maxRetries; attempt++) {
         try {
             if (config.sellMode === 'market') {
-                // Market sell (FOK)
+                // Market sell (FAK) — takes what's available at 2% slippage
                 logger.info(`Sell attempt ${attempt}/${config.maxRetries} (market) | Shares: ${position.shares}`);
 
                 const response = await client.createAndPostMarketOrder(
@@ -294,21 +310,26 @@ export async function executeSell(trade) {
                         tokenID: tokenId,
                         side: Side.SELL,
                         amount: position.shares,
-                        price: Math.max(price * 0.95, 0.01), // 5% slippage, min 0.01
+                        price: Math.max(price * 0.98, 0.01), // 2% slippage, min 0.01
                     },
                     {
                         tickSize: marketOpts.tickSize,
                         negRisk: marketOpts.negRisk,
                     },
-                    OrderType.FOK,
+                    OrderType.FAK, // Fill-and-Kill: takes what's available
                 );
 
                 if (response && response.success) {
-                    logger.success(`Sell order placed: ${response.orderID}`);
-                    filled = true;
-                    break;
+                    const sharesFilled = parseFloat(response.takingAmount || '0');
+                    if (sharesFilled > 0) {
+                        logger.success(`Sell filled: ${response.orderID} | ${sharesFilled.toFixed(4)} shares`);
+                        filled = true;
+                        break;
+                    } else {
+                        logger.warn(`No bid liquidity — FAK filled 0 shares (attempt ${attempt})`);
+                    }
                 } else {
-                    logger.warn(`Sell not filled: ${response?.errorMsg || 'Unknown'}`);
+                    logger.warn(`Sell rejected: ${response?.errorMsg || 'unknown'}`);
                 }
             } else {
                 // Limit sell at trader's sell price
