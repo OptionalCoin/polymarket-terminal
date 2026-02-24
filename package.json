@@ -7,6 +7,9 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon --ignore 'data/*.json' src/index.js",
+    "bot": "node src/bot.js",
+    "bot-sim": "DRY_RUN=true node src/bot.js",
+    "bot-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' src/bot.js",
     "mm": "DRY_RUN=false node src/mm.js",
     "mm-sim": "DRY_RUN=true node src/mm.js",
     "mm-dev": "DRY_RUN=true nodemon --ignore 'data/*.json' src/mm.js",
