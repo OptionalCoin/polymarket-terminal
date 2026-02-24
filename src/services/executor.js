@@ -1,11 +1,31 @@
 import { Side, OrderType } from '@polymarket/clob-client';
+import { ethers } from 'ethers';
 import config from '../config/index.js';
-import { getClient, getUsdcBalance } from './client.js';
+import { getClient, getUsdcBalance, getPolygonProvider } from './client.js';
 import { hasPosition, addPosition, getPosition, updatePosition, removePosition } from './position.js';
 import { fetchMarketByTokenId } from './watcher.js';
 import { placeAutoSell } from './autoSell.js';
+import { ensureExchangeApproval, CTF_ADDRESS } from './ctf.js';
 import { recordSimBuy } from '../utils/simStats.js';
 import logger from '../utils/logger.js';
+
+const CTF_ABI_BALANCE = ['function balanceOf(address account, uint256 id) view returns (uint256)'];
+
+/**
+ * Fetch the actual on-chain ERC-1155 balance for a conditional token.
+ * Returns shares as a plain float (6-decimal conversion).
+ */
+async function getOnChainTokenBalance(tokenId) {
+    try {
+        const provider = await getPolygonProvider();
+        const ctf = new ethers.Contract(CTF_ADDRESS, CTF_ABI_BALANCE, provider);
+        const raw = await ctf.balanceOf(config.proxyWallet, tokenId);
+        return parseFloat(ethers.utils.formatUnits(raw, 6));
+    } catch (err) {
+        logger.warn(`Could not fetch on-chain token balance: ${err.message}`);
+        return null;
+    }
+}
 
 /**
  * Calculate trade size for our entry — independent of the individual fill event.
@@ -237,6 +257,13 @@ export async function executeBuy(trade) {
             outcome: trade.outcome,
         });
 
+        // Ensure the CTF Exchange is approved to move our ERC-1155 tokens (needed for future sells)
+        try {
+            await ensureExchangeApproval(marketOpts.negRisk);
+        } catch (err) {
+            logger.warn(`Could not verify ERC-1155 approval: ${err.message}`);
+        }
+
         // Auto-sell only on initial entry, not on accumulation
         if (config.autoSellEnabled) {
             await placeAutoSell(effectiveConditionId, tokenId, totalSharesFilled, fillAvgPrice, marketOpts);
@@ -296,6 +323,31 @@ export async function executeSell(trade) {
         marketOpts = await getMarketOptions(tokenId);
     }
 
+    // Ensure ERC-1155 approval so the exchange can transfer our tokens
+    try {
+        await ensureExchangeApproval(marketOpts.negRisk);
+    } catch (err) {
+        logger.warn(`Could not verify ERC-1155 approval: ${err.message}`);
+    }
+
+    // Reconcile stored shares with actual on-chain balance to prevent "not enough balance" errors.
+    // The stored amount can be higher than on-chain due to fee deductions or precision drift.
+    const onChain = await getOnChainTokenBalance(tokenId);
+    let sharesToSell = position.shares;
+    if (onChain !== null) {
+        if (onChain < 0.0001) {
+            logger.warn(`On-chain balance is 0 for ${position.market} — position already sold or redeemed`);
+            removePosition(effectiveConditionId);
+            return;
+        }
+        if (onChain < sharesToSell) {
+            logger.info(`Adjusting sell amount: stored ${sharesToSell.toFixed(6)} → on-chain ${onChain.toFixed(6)} shares`);
+            sharesToSell = onChain;
+        }
+    }
+    // Round down to 4 decimal places to avoid sub-unit precision errors
+    sharesToSell = Math.floor(sharesToSell * 10000) / 10000;
+
     const client = getClient();
     let filled = false;
 
@@ -303,13 +355,13 @@ export async function executeSell(trade) {
         try {
             if (config.sellMode === 'market') {
                 // Market sell (FAK) — takes what's available at 2% slippage
-                logger.info(`Sell attempt ${attempt}/${config.maxRetries} (market) | Shares: ${position.shares}`);
+                logger.info(`Sell attempt ${attempt}/${config.maxRetries} (market) | Shares: ${sharesToSell}`);
 
                 const response = await client.createAndPostMarketOrder(
                     {
                         tokenID: tokenId,
                         side: Side.SELL,
-                        amount: position.shares,
+                        amount: sharesToSell,
                         price: Math.max(price * 0.98, 0.01), // 2% slippage, min 0.01
                     },
                     {
@@ -339,7 +391,7 @@ export async function executeSell(trade) {
                     {
                         tokenID: tokenId,
                         price: price,
-                        size: position.shares,
+                        size: sharesToSell,
                         side: Side.SELL,
                     },
                     {
