@@ -56,6 +56,9 @@ const config = {
   mmMarketKeyword: process.env.MM_MARKET_KEYWORD            || 'Bitcoin Up or Down',
   mmEntryWindow:   parseInt(  process.env.MM_ENTRY_WINDOW   || '45', 10), // max secs after open
   mmPollInterval:  parseInt(  process.env.MM_POLL_INTERVAL  || '10', 10) * 1000,
+  mmAdaptiveCL:            process.env.MM_ADAPTIVE_CL !== 'false',           // true = adaptive, false = legacy immediate market-sell
+  mmAdaptiveMinCombined:   parseFloat(process.env.MM_ADAPTIVE_MIN_COMBINED || '1.20'), // min combined sell (both legs) to qualify for limit
+  mmAdaptiveMonitorSec:    parseInt(process.env.MM_ADAPTIVE_MONITOR_SEC || '5', 10),
 
   // ── Recovery Buy (after cut-loss) ─────────────────────────────
   // When enabled: after cutting loss, monitor prices for 10s and
