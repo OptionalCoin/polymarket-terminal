@@ -56,13 +56,13 @@ async function getMarketOptions(tokenId) {
         const marketInfo = await fetchMarketByTokenId(tokenId);
         if (marketInfo) {
             return {
-                tickSize:   String(marketInfo.minimum_tick_size || '0.01'),
-                negRisk:    marketInfo.neg_risk || false,
-                conditionId: marketInfo.condition_id || '',
-                question:   marketInfo.question || '',
-                endDateIso: marketInfo.end_date_iso || marketInfo.game_start_time || null,
-                active:     marketInfo.active !== false,
-                acceptingOrders: marketInfo.accepting_orders !== false,
+                tickSize:        String(marketInfo.orderPriceMinTickSize || '0.01'),
+                negRisk:         marketInfo.negRisk || false,
+                conditionId:     marketInfo.conditionId || '',
+                question:        marketInfo.question || '',
+                endDateIso:      marketInfo.endDate || null,
+                active:          marketInfo.active !== false,
+                acceptingOrders: marketInfo.acceptingOrders !== false,
             };
         }
     } catch (err) {
