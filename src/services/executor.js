@@ -116,6 +116,67 @@ export function executeBuy(trade) {
 }
 
 /**
+ * GTC fallback for when FAK finds no liquidity (e.g. trader buys into "next market"
+ * before any sellers exist). Places a GTC limit order and polls until filled or timeout.
+ *
+ * Returns { sharesFilled, costFilled } on success, or null on failure/timeout.
+ */
+async function _tryGtcFallback(client, tokenId, tradeSize, price, marketOpts) {
+    const gtcPrice = parseFloat(Math.min(price * 1.02, 0.99).toFixed(4));
+    const shares   = parseFloat((tradeSize / gtcPrice).toFixed(4));
+
+    logger.info(`No liquidity via FAK — placing GTC limit buy: ${shares} shares @ $${gtcPrice}`);
+
+    let orderId;
+    try {
+        const resp = await client.createAndPostOrder(
+            { tokenID: tokenId, side: Side.BUY, price: gtcPrice, size: shares },
+            { tickSize: marketOpts.tickSize, negRisk: marketOpts.negRisk },
+            OrderType.GTC,
+        );
+        if (!resp?.success) {
+            logger.warn(`GTC fallback rejected: ${resp?.errorMsg || 'unknown'}`);
+            return null;
+        }
+        orderId = resp.orderID;
+        logger.info(`GTC order placed: ${orderId} — waiting for fill (up to ${config.gtcFallbackTimeout}s)...`);
+    } catch (err) {
+        logger.warn(`GTC fallback order failed: ${err.message}`);
+        return null;
+    }
+
+    const deadline    = Date.now() + config.gtcFallbackTimeout * 1000;
+    const pollMs      = 3000;
+
+    while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, pollMs));
+        try {
+            const order = await client.getOrder(orderId);
+            const matched = parseFloat(order?.size_matched ?? order?.matched_amount ?? '0');
+            const status  = (order?.status ?? order?.order_status ?? '').toLowerCase();
+
+            if (matched > 0 || status === 'matched' || status === 'filled') {
+                const sharesFilled = matched > 0 ? matched : shares;
+                const costFilled   = sharesFilled * gtcPrice;
+                logger.success(`GTC filled: ${sharesFilled.toFixed(4)} shares @ $${gtcPrice} | orderID: ${orderId}`);
+                return { sharesFilled, costFilled };
+            }
+
+            // Order gone from open orders also means it was matched
+            if (status === 'cancelled') {
+                logger.warn(`GTC order ${orderId} was cancelled externally`);
+                return null;
+            }
+        } catch { /* getOrder can 404 briefly — keep polling */ }
+    }
+
+    // Timed out — cancel the GTC
+    logger.warn(`GTC order ${orderId} not filled in ${config.gtcFallbackTimeout}s — cancelling`);
+    try { await client.cancelOrder({ orderID: orderId }); } catch { /* ignore */ }
+    return null;
+}
+
+/**
  * Internal: the actual buy logic, guaranteed to run serially per market.
  */
 async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
@@ -259,6 +320,16 @@ async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
 
         if (attempt < config.maxRetries) {
             await new Promise((r) => setTimeout(r, config.retryDelay));
+        }
+    }
+
+    // FAK found no liquidity — fall back to GTC limit order and wait for fill
+    if (!filled && config.gtcFallbackTimeout > 0) {
+        const gtcResult = await _tryGtcFallback(client, tokenId, tradeSize, price, marketOpts);
+        if (gtcResult) {
+            totalSharesFilled = gtcResult.sharesFilled;
+            totalCostFilled   = gtcResult.costFilled;
+            filled = true;
         }
     }
 
