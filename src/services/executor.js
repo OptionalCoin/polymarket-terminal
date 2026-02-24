@@ -368,7 +368,6 @@ export async function executeSell(trade) {
     // Round down to 4 decimal places to avoid sub-unit precision errors
     sharesToSell = Math.floor(sharesToSell * 10000) / 10000;
 
-    const client = getClient();
     let filled = false;
 
     for (let attempt = 1; attempt <= config.maxRetries; attempt++) {
