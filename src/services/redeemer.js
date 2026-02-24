@@ -1,16 +1,12 @@
 import { ethers } from 'ethers';
 import config from '../config/index.js';
 import { getPolygonProvider } from './client.js';
+import { execSafeCall, CTF_ADDRESS, USDC_ADDRESS } from './ctf.js';
 import { getOpenPositions, removePosition } from './position.js';
 import { recordSimResult } from '../utils/simStats.js';
 import logger from '../utils/logger.js';
 
-// Contract addresses on Polygon
-const CTF_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
-const NEG_RISK_CTF_ADDRESS = '0xC5d563A36AE78145C45a50134d48A1215220f80a';
-const USDC_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
-
-// CTF ABI (minimal for redeemPositions & balanceOf)
+// CTF ABI (minimal — read-only calls only; writes go through execSafeCall)
 const CTF_ABI = [
     'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)',
     'function balanceOf(address owner, uint256 tokenId) view returns (uint256)',
@@ -67,33 +63,29 @@ async function checkOnChainPayout(conditionId) {
 }
 
 /**
- * Redeem winning position on-chain (real mode only)
+ * Redeem winning position on-chain via the Gnosis Safe proxy wallet.
+ * Uses execSafeCall (same as MM bot) so:
+ *   - tx is signed by the EOA but executed FROM the proxy wallet
+ *   - Polygon 30 Gwei minimum tip is enforced
+ *   - automatic retry on transient errors
  */
-async function redeemPosition(conditionId, isNegRisk = false) {
+async function redeemPosition(conditionId) {
     try {
-        const provider = await getPolygonProvider();
-        const wallet = new ethers.Wallet(config.privateKey, provider);
-        const ctfAddress = isNegRisk ? NEG_RISK_CTF_ADDRESS : CTF_ADDRESS;
-        const ctf = new ethers.Contract(ctfAddress, CTF_ABI, wallet);
-
-        const parentCollectionId = ethers.constants.HashZero;
-        const indexSets = [1, 2];
-
-        logger.info(`Redeeming position: ${conditionId}`);
-        const tx = await ctf.redeemPositions(
+        const ctfIface = new ethers.utils.Interface(CTF_ABI);
+        const data = ctfIface.encodeFunctionData('redeemPositions', [
             USDC_ADDRESS,
-            parentCollectionId,
+            ethers.constants.HashZero,
             conditionId,
-            indexSets,
-            { gasLimit: 300000 },
-        );
+            [1, 2],
+        ]);
 
-        logger.info(`Redeem tx: ${tx.hash}`);
-        const receipt = await tx.wait();
+        const label = conditionId.slice(0, 12) + '...';
+        logger.info(`Redeeming position: ${label}`);
+        const receipt = await execSafeCall(CTF_ADDRESS, data, `redeemPositions ${label}`);
         logger.success(`Redeemed in block ${receipt.blockNumber}`);
         return true;
     } catch (err) {
-        logger.error('Failed to redeem:', err.message);
+        logger.error(`Failed to redeem: ${err.message}`);
         return false;
     }
 }
@@ -168,7 +160,7 @@ export async function checkAndRedeemPositions() {
                 const success = await redeemPosition(position.conditionId);
                 if (success) {
                     removePosition(position.conditionId);
-                    logger.money(`Redeemed: ${position.market}`);
+                    logger.money(`Redeemed: ${position.market} → USDC recovered`);
                 }
             }
         } catch (err) {

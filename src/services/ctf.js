@@ -105,7 +105,7 @@ let _txQueue = Promise.resolve();
  * Calls are serialized via an internal queue so nonces never collide.
  * Retries up to MAX_RETRIES times on transient errors.
  */
-function execSafeCall(to, data, description = '') {
+export function execSafeCall(to, data, description = '') {
     // Enqueue: this call will only start after the previous one resolves/rejects
     const result = _txQueue.then(() => _doExecSafeCall(to, data, description));
     // Don't let a failure poison the queue for subsequent calls
