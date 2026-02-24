@@ -179,10 +179,16 @@ export async function executeBuy(trade) {
     let totalSharesFilled = 0;
     let totalCostFilled = 0;
 
+    // Polymarket enforces a hard $1 minimum per market order.
+    const CLOB_MIN_ORDER_USDC = 1;
+
     for (let attempt = 1; attempt <= config.maxRetries; attempt++) {
         try {
             const remainingAmount = tradeSize - totalCostFilled;
-            if (remainingAmount < config.minTradeSize) break;
+            if (remainingAmount < Math.max(config.minTradeSize, CLOB_MIN_ORDER_USDC)) {
+                if (remainingAmount > 0) logger.info(`Remaining $${remainingAmount.toFixed(2)} below $1 minimum — stopping`);
+                break;
+            }
 
             logger.info(`Buy attempt ${attempt}/${config.maxRetries} | Amount: $${remainingAmount.toFixed(2)}`);
 
@@ -209,8 +215,8 @@ export async function executeBuy(trade) {
                     totalSharesFilled += sharesFilled;
                     totalCostFilled   += costFilled || (sharesFilled * price);
                     filled = true;
-                    // If remainder is below minimum, stop; otherwise loop for partial fill
-                    if (tradeSize - totalCostFilled < config.minTradeSize) break;
+                    // If remainder is below $1 minimum, stop; otherwise loop for partial fill
+                    if (tradeSize - totalCostFilled < Math.max(config.minTradeSize, CLOB_MIN_ORDER_USDC)) break;
                 } else {
                     logger.warn(`No liquidity — FAK filled 0 shares (attempt ${attempt})`);
                 }
