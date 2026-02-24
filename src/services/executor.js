@@ -306,15 +306,29 @@ export async function executeSell(trade) {
         return;
     }
 
-    // Cancel existing auto-sell order if any
-    if (position.sellOrderId) {
-        try {
-            const client = getClient();
-            await client.cancelOrder(position.sellOrderId);
-            logger.info(`Cancelled auto-sell order: ${position.sellOrderId}`);
-        } catch (err) {
-            logger.warn(`Failed to cancel auto-sell: ${err.message}`);
+    // Cancel ALL open orders for this token so the CLOB frees up locked balance.
+    // Only cancelling by sellOrderId is not enough — the cancel can fail silently
+    // and locked tokens cause "not enough balance" on the subsequent sell.
+    const client = getClient();
+    try {
+        const openOrders = await client.getOpenOrders({ asset_id: tokenId });
+        if (Array.isArray(openOrders) && openOrders.length > 0) {
+            logger.info(`Cancelling ${openOrders.length} open order(s) for token before sell`);
+            await Promise.allSettled(
+                openOrders.map((o) => client.cancelOrder({ orderID: o.id ?? o.order_id })),
+            );
+            // Brief pause so the CLOB can update the locked-balance ledger
+            await new Promise((r) => setTimeout(r, 600));
         }
+    } catch (err) {
+        // Fallback: try to cancel just the tracked auto-sell order ID
+        if (position.sellOrderId) {
+            try {
+                await client.cancelOrder({ orderID: position.sellOrderId });
+                await new Promise((r) => setTimeout(r, 600));
+            } catch { /* ignore */ }
+        }
+        logger.warn(`Could not fetch open orders to cancel: ${err.message}`);
     }
 
     updatePosition(effectiveConditionId, { status: 'selling' });
