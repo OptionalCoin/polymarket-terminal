@@ -133,6 +133,14 @@ async function simPriceHitTarget(tokenId) {
     }
 }
 
+// Get current mid price for a token (0 on error)
+async function getMidprice(tokenId) {
+    try {
+        const mp = await getClient().getMidpoint(tokenId);
+        return parseFloat(mp?.mid ?? mp ?? '0') || 0;
+    } catch { return 0; }
+}
+
 // ── Core monitoring loop ──────────────────────────────────────────────────────
 
 async function monitorAndManage(pos) {
@@ -189,11 +197,27 @@ async function monitorAndManage(pos) {
             break;
         }
 
-        // ── Cut-loss time ───────────────────────────────────────
+        // ── Exactly one leg filled → adaptive cut-loss (if enabled) ────────
+        if (config.mmAdaptiveCL && pos.yes.filled !== pos.no.filled) {
+            const unfilledKey = pos.yes.filled ? 'no' : 'yes';
+            await adaptiveLegCL(pos, unfilledKey);
+            break;
+        }
+
+        // ── Cut-loss time ────────────────────────────────────────────────────
         if (msRemaining <= config.mmCutLossTime * 1000) {
             logger.warn(`MM: cut-loss triggered (${Math.round(msRemaining / 1000)}s left) — ${label}`);
             pos.status = 'cutting';
-            await cutLoss(pos);
+            const oneLegFilled = pos.yes.filled !== pos.no.filled;
+            if (!config.mmAdaptiveCL && oneLegFilled) {
+                // Legacy: one side sold → immediate market sell on the other
+                const unfilledKey = pos.yes.filled ? 'no' : 'yes';
+                await cutLossOneLegFilled(pos, unfilledKey);
+                pos.status = 'done';
+            } else {
+                // Neither filled → cancel both + merge back to USDC
+                await cutLossNeitherFilled(pos);
+            }
             break;
         }
 
@@ -208,75 +232,209 @@ async function monitorAndManage(pos) {
     }
 }
 
-async function cutLoss(pos) {
-    const { conditionId, tickSize, negRisk } = pos;
-    const neitherFilled = !pos.yes.filled && !pos.no.filled;
+// Legacy one-leg CL: cancel unfilled order, immediate market sell (no patience)
+async function cutLossOneLegFilled(pos, unfilledKey) {
+    const s = pos[unfilledKey];
+    const { tickSize, negRisk } = pos;
 
-    if (neitherFilled) {
-        // ── Best case: neither side sold → cancel both, merge back to USDC ──
-        logger.warn('MM: neither side filled — cancelling orders and merging back to USDC...');
-        await cancelOrder(pos.yes.orderId);
-        await cancelOrder(pos.no.orderId);
+    logger.warn(`MM: cancelling ${unfilledKey.toUpperCase()} limit order and market-selling...`);
+    await cancelOrder(s.orderId);
 
-        // Read actual on-chain balances (may differ from original if partially consumed)
-        const [yesActual, noActual] = await Promise.all([
-            getTokenBalance(pos.yes.tokenId),
-            getTokenBalance(pos.no.tokenId),
-        ]);
+    const actualShares = await getTokenBalance(s.tokenId);
+    const sellShares   = actualShares !== null ? actualShares : s.shares;
 
-        // mergePositions needs equal amounts — use the minimum actual balance
-        const yesShares = yesActual ?? pos.yes.shares;
-        const noShares = noActual ?? pos.no.shares;
-        const mergeAmt = Math.min(yesShares, noShares);
-
-        if (mergeAmt < 0.001) {
-            logger.warn('MM: balances too low to merge — nothing to recover');
-        } else {
-            const recovered = await mergePositions(conditionId, mergeAmt);
-            logger.money(`MM: merge complete — recovered ~$${recovered.toFixed ? recovered.toFixed(2) : recovered} USDC (P&L ≈ $0)`);
-        }
-
-        // Mark both sides closed at entry price
-        pos.yes.fillPrice = pos.yes.entryPrice;
-        pos.yes.filled = true;
-        pos.no.fillPrice = pos.no.entryPrice;
-        pos.no.filled = true;
-
-    } else {
-        // ── One side already (partly) sold → market-sell the unfilled side ──
-        for (const side of ['yes', 'no']) {
-            const s = pos[side];
-            if (s.filled) continue;
-
-            logger.warn(`MM: cancelling ${side.toUpperCase()} limit order and market-selling...`);
-            await cancelOrder(s.orderId);
-
-            // Fetch actual on-chain balance — partial fills reduce this below s.shares
-            const actualShares = await getTokenBalance(s.tokenId);
-            const sellShares = actualShares !== null ? actualShares : s.shares;
-
-            if (sellShares < 0.001) {
-                logger.warn(`MM: ${side.toUpperCase()} balance is 0 — already fully sold via partial fills`);
-                s.fillPrice = config.mmSellPrice; // assume sold at target
-                s.filled = true;
-                continue;
-            }
-
-            logger.warn(`MM: ${side.toUpperCase()} actual balance: ${sellShares.toFixed(3)} shares (original: ${s.shares})`);
-
-            const result = await marketSell(s.tokenId, sellShares, tickSize, negRisk);
-            s.fillPrice = result.fillPrice;
-            s.filled = true;
-            // PnL uses actual sold amount (not original pos.shares)
-            const pnl = (s.fillPrice - s.entryPrice) * sellShares;
-            logger.warn(`MM: ${side.toUpperCase()} cut @ $${s.fillPrice.toFixed(3)} | sold ${sellShares.toFixed(3)} sh | P&L $${pnl.toFixed(2)}`);
-        }
+    if (sellShares < 0.001) {
+        logger.warn(`MM: ${unfilledKey.toUpperCase()} balance is 0 — already fully sold via partial fills`);
+        s.fillPrice = config.mmSellPrice;
+        s.filled    = true;
+        return;
     }
+
+    logger.warn(`MM: ${unfilledKey.toUpperCase()} actual balance: ${sellShares.toFixed(3)} shares (original: ${s.shares})`);
+    const result = await marketSell(s.tokenId, sellShares, tickSize, negRisk);
+    s.fillPrice  = result.fillPrice;
+    s.filled     = true;
+    const pnl    = (s.fillPrice - s.entryPrice) * sellShares;
+    logger.warn(`MM: ${unfilledKey.toUpperCase()} cut @ $${s.fillPrice.toFixed(3)} | sold ${sellShares.toFixed(3)} sh | P&L $${pnl.toFixed(2)}`);
+}
+
+async function cutLossNeitherFilled(pos) {
+    const { conditionId } = pos;
+
+    // ── Best case: neither side sold → cancel both, merge back to USDC ──
+    logger.warn('MM: neither side filled — cancelling orders and merging back to USDC...');
+    await cancelOrder(pos.yes.orderId);
+    await cancelOrder(pos.no.orderId);
+
+    // Read actual on-chain balances (may differ from original if partially consumed)
+    const [yesActual, noActual] = await Promise.all([
+        getTokenBalance(pos.yes.tokenId),
+        getTokenBalance(pos.no.tokenId),
+    ]);
+
+    // mergePositions needs equal amounts — use the minimum actual balance
+    const yesShares = yesActual ?? pos.yes.shares;
+    const noShares = noActual ?? pos.no.shares;
+    const mergeAmt = Math.min(yesShares, noShares);
+
+    if (mergeAmt < 0.001) {
+        logger.warn('MM: balances too low to merge — nothing to recover');
+    } else {
+        const recovered = await mergePositions(conditionId, mergeAmt);
+        logger.money(`MM: merge complete — recovered ~$${recovered.toFixed ? recovered.toFixed(2) : recovered} USDC (P&L ≈ $0)`);
+    }
+
+    // Mark both sides closed at entry price
+    pos.yes.fillPrice = pos.yes.entryPrice;
+    pos.yes.filled = true;
+    pos.no.fillPrice = pos.no.entryPrice;
+    pos.no.filled = true;
 
     pos.status = 'done';
 
     // Optional recovery buy (enabled via MM_RECOVERY_BUY=true)
     await attemptRecoveryBuy(pos);
+}
+
+async function adaptiveLegCL(pos, unfilledKey) {
+    const s = pos[unfilledKey];
+    const { tickSize, negRisk } = pos;
+    const label  = pos.question.substring(0, 40);
+    const pollMs = config.mmAdaptiveMonitorSec * 1000;
+
+    // ── Minimum floor: unfilled leg must sell at least this price ──────────────
+    // Ensures: filledLegPrice + unfilledLegPrice >= mmAdaptiveMinCombined
+    // Example: filledLeg=0.60, minCombined=1.20 → floor=0.60
+    //          filledLeg=0.55, minCombined=1.20 → floor=0.65
+    const filledKey        = unfilledKey === 'yes' ? 'no' : 'yes';
+    const filledLegPrice   = pos[filledKey].fillPrice ?? config.mmSellPrice;
+    const minAdaptivePrice = Math.max(0, config.mmAdaptiveMinCombined - filledLegPrice);
+
+    logger.warn(`MM: one leg filled — starting adaptive CL for ${unfilledKey.toUpperCase()} | ${label}`);
+    logger.info(`MM adaptive CL: filled leg @ $${filledLegPrice.toFixed(3)} | min floor for combined ≥ $${config.mmAdaptiveMinCombined.toFixed(2)}: $${minAdaptivePrice.toFixed(3)}`);
+
+    // Cancel the unfilled leg's old GTC order immediately
+    await cancelOrder(s.orderId);
+    s.orderId = null;
+
+    // Read actual on-chain balance once — reused for all subsequent sell orders
+    const actualShares = await getTokenBalance(s.tokenId);
+    const sellShares   = actualShares !== null ? actualShares : s.shares;
+
+    if (sellShares < 0.001) {
+        logger.warn(`MM adaptive CL: ${unfilledKey.toUpperCase()} balance is 0 — already fully sold`);
+        s.fillPrice = config.mmSellPrice;
+        s.filled    = true;
+        pos.status  = 'done';
+        return;
+    }
+
+    logger.info(`MM adaptive CL: monitoring ${unfilledKey.toUpperCase()} — limit only when price ≥ $${minAdaptivePrice.toFixed(3)}, market-sell only at CL time`);
+
+    let activeOrderId    = null;
+    let activeLimitPrice = 0;
+
+    // ── Continuous monitoring loop ─────────────────────────────────────────────
+    // Every poll cycle:
+    //   1. CL time → cancel limit, market sell (last resort)
+    //   2. Check fill → done
+    //   3. Read current price
+    //   4a. Price < floor OR dropped >5% → cancel limit, keep watching
+    //   4b. Price improved >2% → cancel and re-place higher
+    //   5a. price >= floor → place/maintain limit at min(currentPrice, mmSellPrice)
+    //   5b. price < floor → no limit placed, log & wait (never sell below profit floor)
+    while (true) {
+        const msLeft = new Date(pos.endTime).getTime() - Date.now();
+
+        // ── CL time: last resort market sell ───────────────────────────────
+        if (msLeft <= config.mmCutLossTime * 1000) {
+            if (activeOrderId) {
+                await cancelOrder(activeOrderId);
+                activeOrderId = null;
+            }
+            break;
+        }
+
+        // ── Check fill ──────────────────────────────────────────────────────
+        if (activeOrderId) {
+            let filled = false;
+            if (config.dryRun) {
+                const hitPrice = await simPriceHitTarget(s.tokenId);
+                if (hitPrice) { filled = true; s.fillPrice = hitPrice; }
+            } else {
+                filled = await isOrderFilled(activeOrderId, sellShares);
+                if (filled) s.fillPrice = activeLimitPrice;
+            }
+
+            if (filled) {
+                const pnl      = (s.fillPrice - s.entryPrice) * sellShares;
+                const combined = filledLegPrice + s.fillPrice;
+                logger.money(`MM adaptive CL: ${unfilledKey.toUpperCase()} limit filled @ $${s.fillPrice.toFixed(3)} | combined $${combined.toFixed(3)} | P&L $${pnl.toFixed(2)}`);
+                s.filled   = true;
+                pos.status = 'done';
+                return;
+            }
+        }
+
+        // ── Read current price ──────────────────────────────────────────────
+        const currentPrice = await getMidprice(s.tokenId);
+        if (currentPrice <= 0) {
+            await sleep(pollMs);
+            continue;
+        }
+
+        const targetPrice = Math.min(currentPrice, config.mmSellPrice);
+
+        // ── Adjust or cancel active limit ───────────────────────────────────
+        if (activeOrderId) {
+            const belowFloor    = currentPrice < minAdaptivePrice;
+            const droppedHard   = currentPrice < activeLimitPrice * 0.95;
+            const priceImproved = targetPrice > activeLimitPrice * 1.02;
+
+            if (belowFloor || droppedHard) {
+                const reason = belowFloor
+                    ? `below floor $${minAdaptivePrice.toFixed(3)} (combined $${(filledLegPrice + currentPrice).toFixed(3)} < $${config.mmAdaptiveMinCombined.toFixed(2)})`
+                    : `dropped >5% from limit $${activeLimitPrice.toFixed(3)}`;
+                logger.info(`MM adaptive CL: price $${currentPrice.toFixed(3)} ${reason} — cancelling limit, watching for recovery`);
+                await cancelOrder(activeOrderId);
+                activeOrderId    = null;
+                activeLimitPrice = 0;
+
+            } else if (priceImproved) {
+                logger.info(`MM adaptive CL: price improved $${activeLimitPrice.toFixed(3)} → $${currentPrice.toFixed(3)} — raising limit to $${targetPrice.toFixed(3)}`);
+                await cancelOrder(activeOrderId);
+                activeOrderId    = null;
+                activeLimitPrice = 0;
+            }
+        }
+
+        // ── Place limit only above the profitable floor ─────────────────────
+        if (!activeOrderId) {
+            if (currentPrice >= minAdaptivePrice) {
+                logger.info(`MM adaptive CL: placing limit sell @ $${targetPrice.toFixed(3)} (mid: $${currentPrice.toFixed(3)}, combined: $${(filledLegPrice + targetPrice).toFixed(3)}, ${Math.round(msLeft / 1000)}s left)`);
+                const result = await placeLimitSell(s.tokenId, sellShares, targetPrice, tickSize, negRisk);
+                if (result.success) {
+                    activeOrderId    = result.orderId;
+                    activeLimitPrice = targetPrice;
+                }
+            } else {
+                logger.info(`MM adaptive CL: price $${currentPrice.toFixed(3)} below floor $${minAdaptivePrice.toFixed(3)} (combined $${(filledLegPrice + currentPrice).toFixed(3)}) — waiting for recovery (${Math.round(msLeft / 1000)}s left)`);
+            }
+        }
+
+        await sleep(pollMs);
+    }
+
+    // ── Fallback: market sell at CL time ───────────────────────────────────────
+    logger.warn(`MM adaptive CL: CL time reached — market-selling ${sellShares.toFixed(3)} ${unfilledKey.toUpperCase()} shares`);
+    const result   = await marketSell(s.tokenId, sellShares, tickSize, negRisk);
+    s.fillPrice    = result.fillPrice;
+    const pnl      = (s.fillPrice - s.entryPrice) * sellShares;
+    const combined = filledLegPrice + s.fillPrice;
+    logger.warn(`MM adaptive CL: ${unfilledKey.toUpperCase()} market-sold @ $${s.fillPrice.toFixed(3)} | combined $${combined.toFixed(3)} | sold ${sellShares.toFixed(3)} sh | P&L $${pnl.toFixed(2)}`);
+
+    s.filled   = true;
+    pos.status = 'done';
 }
 
 // ── Recovery buy ──────────────────────────────────────────────────────────────
