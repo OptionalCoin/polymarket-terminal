@@ -1,47 +1,81 @@
 /**
  * PM2 ecosystem config
  *
- * Usage:
+ * Start all bots:
  *   pm2 start ecosystem.config.cjs            # live trading
  *   pm2 start ecosystem.config.cjs --env sim  # simulation / dry-run
  *
- *   pm2 logs polymarket-copy          # tail logs
+ * Start individual bot:
+ *   pm2 start ecosystem.config.cjs --only polymarket-copy
+ *   pm2 start ecosystem.config.cjs --only polymarket-mm
+ *   pm2 start ecosystem.config.cjs --only polymarket-copy --env sim
+ *   pm2 start ecosystem.config.cjs --only polymarket-mm  --env sim
+ *
+ * Logs:
+ *   pm2 logs                          # all bots
+ *   pm2 logs polymarket-copy          # copy trade only
+ *   pm2 logs polymarket-mm            # market maker only
  *   pm2 logs polymarket-copy --lines 200
- *   pm2 stop / restart / delete polymarket-copy
+ *
+ * Management:
+ *   pm2 restart / stop / delete polymarket-copy
+ *   pm2 restart / stop / delete polymarket-mm
+ *   pm2 restart all
  */
 module.exports = {
     apps: [
+        // ── Copy Trade Bot ─────────────────────────────────────────────────────
         {
             name: 'polymarket-copy',
             script: 'src/bot.js',
             interpreter: 'node',
 
-            // Live trading (default)
             env: {
                 NODE_ENV: 'production',
                 DRY_RUN:  'false',
             },
-
-            // Simulation: pm2 start ecosystem.config.cjs --env sim
             env_sim: {
                 NODE_ENV: 'production',
                 DRY_RUN:  'true',
             },
 
-            // Log files (relative to project root)
-            out_file:        'logs/out.log',
-            error_file:      'logs/error.log',
+            out_file:        'logs/copy-out.log',
+            error_file:      'logs/copy-error.log',
             log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
             merge_logs:      true,
 
-            // Restart policy
-            restart_delay:  5000,   // wait 5s before restarting
-            max_restarts:   10,     // give up after 10 crashes in a row
-            min_uptime:     '10s',  // must stay up ≥10s to count as "stable"
+            restart_delay:      5000,
+            max_restarts:       10,
+            min_uptime:         '10s',
             max_memory_restart: '256M',
+            stop_exit_codes:    [0],
+        },
 
-            // Treat non-zero exit as a crash (don't restart on clean SIGTERM)
-            stop_exit_codes: [0],
+        // ── Market Maker Bot ───────────────────────────────────────────────────
+        {
+            name: 'polymarket-mm',
+            script: 'src/mm-bot.js',
+            interpreter: 'node',
+
+            env: {
+                NODE_ENV: 'production',
+                DRY_RUN:  'false',
+            },
+            env_sim: {
+                NODE_ENV: 'production',
+                DRY_RUN:  'true',
+            },
+
+            out_file:        'logs/mm-out.log',
+            error_file:      'logs/mm-error.log',
+            log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+            merge_logs:      true,
+
+            restart_delay:      5000,
+            max_restarts:       10,
+            min_uptime:         '10s',
+            max_memory_restart: '256M',
+            stop_exit_codes:    [0],
         },
     ],
 };
