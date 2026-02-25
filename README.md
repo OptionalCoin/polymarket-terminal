@@ -13,37 +13,38 @@
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Usage](#usage)
+- [Running on VPS with PM2](#running-on-vps-with-pm2)
 - [How It Works](#how-it-works)
 - [Project Structure](#project-structure)
 - [Important Warnings](#important-warnings)
-- [Contributing](#contributing)
 - [License](#license)
 
 ---
 
 ## Features
 
-### Copy Trade Bot (`npm start`)
+### Copy Trade Bot
 - **Watch Trader** — Monitor any Polymarket wallet address in real time via WebSocket
 - **Copy Buy** — Automatically mirror buy orders with configurable position sizing
 - **Copy Sell** — Automatically mirror sell orders (market or limit)
 - **Auto Sell** — Place a GTC limit sell at a target profit % immediately after a buy fills
 - **Auto Redeem** — Periodically check and redeem winning positions on-chain
-- **Deduplication** — Each market is entered at most once; no double buys
-- **Balance Guard** — Checks USDC.e balance before every order
+- **Market Expiry Guard** — Skip buys if market closes within `MIN_MARKET_TIME_LEFT` seconds
+- **GTC Fallback** — Falls back to a GTC limit order when copying "next market" trades with no liquidity
+- **Per-Market Queue** — Concurrent events for the same market are serialized to prevent duplicate buys
 - **Dry Run Mode** — Simulate the full flow without placing real orders
 
-### Market Maker Bot (`npm run mm`)
+### Market Maker Bot
 - **Automated Liquidity** — Splits USDC into YES+NO tokens and places limit sells on both sides at $0.50 entry
 - **Cut-Loss Protection** — Merges unsold tokens back to USDC before market close
 - **Recovery Buy** — Optional directional bet after a cut-loss triggers
 - **Multi-Asset** — Supports BTC, ETH, SOL, and any 5m/15m Polymarket market
-- **Simulation Mode** — Full dry-run with P&L tracking (`npm run mm-sim`)
+- **Simulation Mode** — Full dry-run with P&L tracking
 
-### Orderbook Sniper Bot (`npm run sniper`)
+### Orderbook Sniper Bot
 - **Low-Price Orders** — Places tiny GTC BUY orders at a configurable price (e.g. $0.01) on both sides
 - **Multi-Asset** — Targets ETH, SOL, XRP, and more simultaneously
-- **Simulation Mode** — Preview orders without spending funds (`npm run sniper-sim`)
+- **Simulation Mode** — Preview orders without spending funds
 
 ---
 
@@ -56,6 +57,7 @@
 | Polymarket Proxy Wallet | Your proxy wallet address (visible on your Polymarket profile → Deposit) |
 | USDC.e on Polygon | Deposited via Polymarket's deposit flow |
 | MATIC on Polygon | A small amount for gas fees (redeem & on-chain operations) |
+| PM2 *(optional)* | For running on a VPS: `npm install -g pm2` |
 
 ---
 
@@ -72,8 +74,8 @@ npm install
 # 3. Copy the environment template
 cp .env.example .env
 
-# 4. Fill in your credentials (see Configuration section below)
-nano .env   # or use your preferred editor
+# 4. Fill in your credentials
+nano .env
 ```
 
 ---
@@ -115,6 +117,8 @@ Leave these blank to have the client auto-derive credentials from your private k
 | `AUTO_SELL_PROFIT_PERCENT` | Target profit % for the auto-sell limit order | `10` |
 | `SELL_MODE` | `market` or `limit` when copying a sell | `market` |
 | `REDEEM_INTERVAL` | Seconds between redemption checks | `60` |
+| `MIN_MARKET_TIME_LEFT` | Skip buy if market closes within this many seconds | `300` |
+| `GTC_FALLBACK_TIMEOUT` | Seconds to wait for GTC fill when FAK finds no liquidity | `60` |
 | `DRY_RUN` | Simulate without placing real orders | `true` |
 
 ### Market Maker Bot Settings
@@ -145,23 +149,100 @@ Leave these blank to have the client auto-derive credentials from your private k
 
 ## Usage
 
+### Terminal UI (local)
+
+Runs with an interactive split-panel dashboard (blessed TUI).
+
 ```bash
-# ── Copy Trade Bot ─────────────────────────────────
-npm start           # Production mode
-npm run dev         # Development mode (auto-reload on file changes)
+# Copy Trade Bot
+npm start           # live trading
+npm run dev         # live + auto-reload on file changes
 
-# ── Market Maker Bot ───────────────────────────────
-npm run mm          # Live trading (DRY_RUN=false)
-npm run mm-sim      # Simulation mode (DRY_RUN=true)
-npm run mm-dev      # Simulation + auto-reload
+# Market Maker Bot
+npm run mm          # live trading
+npm run mm-sim      # simulation (DRY_RUN=true)
+npm run mm-dev      # simulation + auto-reload
 
-# ── Orderbook Sniper Bot ───────────────────────────
-npm run sniper      # Live trading (DRY_RUN=false)
-npm run sniper-sim  # Simulation mode (DRY_RUN=true)
-npm run sniper-dev  # Simulation + auto-reload
+# Orderbook Sniper Bot
+npm run sniper      # live trading
+npm run sniper-sim  # simulation
+npm run sniper-dev  # simulation + auto-reload
 ```
 
-> **Always test with `DRY_RUN=true` first** before committing real funds.
+### Plain Log Mode (no TUI)
+
+Writes plain timestamped text to stdout — suitable for piping, `tail -f`, or PM2.
+
+```bash
+# Copy Trade Bot
+npm run bot         # live trading
+npm run bot-sim     # simulation
+npm run bot-dev     # simulation + auto-reload
+
+# Market Maker Bot
+npm run mm-bot      # live trading
+npm run mm-bot-sim  # simulation
+npm run mm-bot-dev  # simulation + auto-reload
+```
+
+> **Always test with `DRY_RUN=true` (or `*-sim` scripts) first** before committing real funds.
+
+---
+
+## Running on VPS with PM2
+
+Each bot has its own PM2 config file inside the `pm2/` folder.
+
+### Install PM2
+
+```bash
+npm install -g pm2
+```
+
+### Copy Trade Bot
+
+```bash
+# Live trading
+pm2 start pm2/copy.config.cjs
+
+# Simulation
+pm2 start pm2/copy.config.cjs --env sim
+
+# View logs
+pm2 logs polymarket-copy
+tail -f logs/copy-out.log
+
+# Management
+pm2 restart polymarket-copy
+pm2 stop polymarket-copy
+pm2 delete polymarket-copy
+```
+
+### Market Maker Bot
+
+```bash
+# Live trading
+pm2 start pm2/mm.config.cjs
+
+# Simulation
+pm2 start pm2/mm.config.cjs --env sim
+
+# View logs
+pm2 logs polymarket-mm
+tail -f logs/mm-out.log
+
+# Management
+pm2 restart polymarket-mm
+pm2 stop polymarket-mm
+pm2 delete polymarket-mm
+```
+
+### Auto-start on reboot
+
+```bash
+pm2 startup        # generates a startup command — run the command it prints
+pm2 save           # saves current process list
+```
 
 ---
 
@@ -170,24 +251,25 @@ npm run sniper-dev  # Simulation + auto-reload
 ### Copy Trade Bot Flow
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    WATCHER LOOP                          │
-│  WebSocket (RTDS) — real-time trade events from trader   │
-│  Fallback: poll Data API every N seconds                 │
-├───────────────────────┬──────────────────────────────────┤
-│      NEW BUY          │          NEW SELL                │
-│                       │                                  │
-│  ✓ Check position     │  ✓ Check position exists         │
-│  ✓ Check USDC balance │  ✓ Cancel existing auto-sell     │
-│  ✓ Market buy (FOK)   │  ✓ Market / limit sell           │
-│  ✓ Retry on failure   │  ✓ Retry on failure              │
-│  ✓ Place auto-sell    │  ✓ Remove position from state    │
-│  ✓ Save position      │                                  │
-├───────────────────────┴──────────────────────────────────┤
-│                   REDEEMER LOOP                          │
-│  Periodically checks resolved markets                    │
-│  → Redeems winning positions via CTF contract on-chain   │
-└──────────────────────────────────────────────────────────┘
+WebSocket (RTDS) — real-time trade events from trader
+        │
+        ▼
+Per-market queue (prevents concurrent duplicate buys)
+        │
+   ┌────┴──────┐
+   │           │
+  BUY         SELL
+   │           │
+   ├─ Expiry guard (MIN_MARKET_TIME_LEFT)
+   ├─ Max position cap          ├─ Cancel open orders
+   ├─ FAK market buy            ├─ Reconcile on-chain balance
+   │  └─ 0 fill? → GTC fallback ├─ FAK market sell / limit sell
+   ├─ Place auto-sell GTC       └─ Remove position
+   └─ Save position
+        │
+        ▼
+Redeemer loop (every REDEEM_INTERVAL seconds)
+  → Check on-chain payout → redeemPositions via Gnosis Safe
 ```
 
 ### Market Maker Flow
@@ -206,7 +288,7 @@ Monitor fills every few seconds
         │
    ┌────┴────┐
    │         │
-Fill    Time < MM_CUT_LOSS_TIME
+ Fill    Time < MM_CUT_LOSS_TIME
    │         │
    ▼         ▼
 Collect  Cancel orders → Merge YES+NO back to USDC
@@ -220,9 +302,11 @@ Collect  Cancel orders → Merge YES+NO back to USDC
 ```
 polymarket-terminal/
 ├── src/
-│   ├── index.js               — Copy trade bot entry point
-│   ├── mm.js                  — Market maker bot entry point
-│   ├── sniper.js              — Orderbook sniper bot entry point
+│   ├── index.js               — Copy trade bot (TUI)
+│   ├── bot.js                 — Copy trade bot (plain log / PM2)
+│   ├── mm.js                  — Market maker bot (TUI)
+│   ├── mm-bot.js              — Market maker bot (plain log / PM2)
+│   ├── sniper.js              — Orderbook sniper bot
 │   │
 │   ├── config/
 │   │   └── index.js           — Environment variable loading & validation
@@ -235,7 +319,7 @@ polymarket-terminal/
 │   │   ├── position.js        — Position state management (CRUD)
 │   │   ├── autoSell.js        — Auto limit-sell placement
 │   │   ├── redeemer.js        — Market resolution check & CTF redemption
-│   │   ├── ctf.js             — On-chain CTF contract interactions (MM bot)
+│   │   ├── ctf.js             — On-chain CTF contract interactions
 │   │   ├── mmDetector.js      — Market detection for market maker
 │   │   ├── mmExecutor.js      — Market maker strategy execution
 │   │   ├── sniperDetector.js  — Market detection for sniper
@@ -245,11 +329,16 @@ polymarket-terminal/
 │   │   └── dashboard.js       — Terminal UI (blessed)
 │   │
 │   └── utils/
-│       ├── logger.js          — Color-coded, timestamped logging
+│       ├── logger.js          — Timestamped logging (TUI + plain modes)
 │       ├── state.js           — Atomic JSON state file management
 │       └── simStats.js        — Simulation P&L statistics
 │
+├── pm2/
+│   ├── copy.config.cjs        — PM2 config for copy trade bot
+│   └── mm.config.cjs          — PM2 config for market maker bot
+│
 ├── data/                      — Runtime state files (gitignored)
+├── logs/                      — PM2 log files (gitignored)
 ├── .env.example               — Configuration template
 ├── .gitignore
 └── package.json
@@ -260,23 +349,10 @@ polymarket-terminal/
 ## Important Warnings
 
 - **Never commit your `.env` file.** Your private key must remain secret. The `.gitignore` already excludes it.
-- **Always start with `DRY_RUN=true`** to verify the bot behaves as expected before using real funds.
+- **Always start with `DRY_RUN=true`** (or a `*-sim` script) to verify the bot behaves as expected before using real funds.
 - **Use a small `SIZE_PERCENT`** for initial live runs to limit exposure.
 - **Keep MATIC in your EOA wallet** for gas fees (redeem operations and on-chain CTF calls).
 - **This software is provided as-is, with no guarantees.** Prediction market trading carries significant financial risk. You are solely responsible for any losses.
-
----
-
-## Contributing
-
-Contributions are welcome! To get started:
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feat/your-feature`
-3. Make your changes and ensure the code is clean and well-documented
-4. Open a pull request describing what you changed and why
-
-Please keep pull requests focused and avoid mixing unrelated changes.
 
 ---
 
