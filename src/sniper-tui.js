@@ -7,6 +7,9 @@
  *           npm run sniper-tui-sim   (simulation)
  */
 
+// Load proxy patch BEFORE any other imports (must patch https before axios is loaded)
+import './utils/proxy-patch.cjs';
+
 import { validateMMConfig } from './config/index.js';
 import config from './config/index.js';
 import logger from './utils/logger.js';
