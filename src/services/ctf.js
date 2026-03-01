@@ -511,10 +511,16 @@ export async function redeemMMPositions() {
 
 // ── Sniper-specific redeemer ──────────────────────────────────────────────────
 
+// Track conditionIds that repeatedly fail to avoid retrying every cycle
+const _failedConditions = new Set();
+
 /**
- * Redeem ONLY winning sniper positions via Gnosis Safe.
- * Same approach as redeemMMPositions but skips losers ($0 payout).
- * Redeems one by one — simple and reliable.
+ * Redeem sniper positions via Gnosis Safe.
+ * Works exactly like the MM redeemer (redeemMMPositions):
+ *   - Redeems ALL resolved positions (both winners and losers)
+ *   - Burning loser tokens cleans them from the Data API, keeping cycles fast
+ *   - Logs winners separately for profit tracking
+ *   - Skips conditionIds that previously reverted on-chain
  */
 export async function redeemSniperPositions() {
     // 1. Query Data API for all positions held by the proxy wallet
@@ -533,7 +539,6 @@ export async function redeemSniperPositions() {
     }
 
     if (dataPositions.length === 0) return;
-    logger.info(`SNIPER redeemer: checking ${dataPositions.length} position(s)...`);
 
     const provider = await getPolygonProvider();
     const ctf = new ethers.Contract(CTF_ADDRESS, CTF_ABI, provider);
@@ -555,12 +560,15 @@ export async function redeemSniperPositions() {
     let redeemed = 0;
 
     for (const [conditionId, tokens] of byCondition) {
+        // Skip conditionIds that previously failed on-chain
+        if (_failedConditions.has(conditionId)) continue;
+
         try {
             // Skip unresolved markets
             const denominator = await ctf.payoutDenominator(conditionId);
             if (denominator.isZero()) continue;
 
-            // Check actual on-chain token balances
+            // Check actual on-chain token balances (positions API can lag)
             const balances = await Promise.all(
                 tokens.map(({ tokenId }) =>
                     ctf.balanceOf(config.proxyWallet, tokenId)
@@ -568,9 +576,9 @@ export async function redeemSniperPositions() {
                 )
             );
             const totalShares = balances.reduce((a, b) => a + b, 0);
-            if (totalShares < 0.001) continue;
+            if (totalShares < 0.001) continue; // nothing on-chain to redeem
 
-            // Calculate expected payout
+            // Estimate payout from numerators (for logging)
             const payoutFractions = await Promise.all(
                 [0, 1].map((i) =>
                     ctf.payoutNumerators(conditionId, i)
@@ -582,36 +590,44 @@ export async function redeemSniperPositions() {
             );
 
             const label = conditionId.slice(0, 12) + '...';
-
-            // ── WIN-ONLY: skip if payout is ~$0 (loser) ──
-            if (expectedUsdc < 0.01) {
-                logger.info(`SNIPER redeemer: skip ${label} — $0 payout (loss)`);
-                continue;
-            }
+            const isWin = expectedUsdc >= 0.01;
 
             if (config.dryRun) {
-                logger.money(`SNIPER[SIM] redeem: ${label} — ${totalShares.toFixed(3)} shares → ~$${expectedUsdc.toFixed(2)} USDC (WIN)`);
+                if (isWin) {
+                    logger.money(`SNIPER[SIM] redeem: ${label} — ${totalShares.toFixed(3)} shares → ~$${expectedUsdc.toFixed(2)} USDC (WIN)`);
+                } else {
+                    logger.info(`SNIPER[SIM] redeem: ${label} — ${totalShares.toFixed(3)} shares → $0 (loss, burning tokens)`);
+                }
                 continue;
             }
 
-            logger.info(`SNIPER redeemer: ${label} resolved — ${totalShares.toFixed(3)} shares → ~$${expectedUsdc.toFixed(2)} USDC`);
+            logger.info(`SNIPER redeemer: ${label} resolved — ${totalShares.toFixed(3)} shares → ~$${expectedUsdc.toFixed(2)} USDC${isWin ? '' : ' (loss)'}`);
 
-            // Redeem through Safe — same as MM redeemer
+            // Call redeemPositions through Safe — exactly like MM redeemer
             const data = ctfIface.encodeFunctionData('redeemPositions', [
                 USDC_ADDRESS,
                 ethers.constants.HashZero,
                 conditionId,
                 [1, 2],
             ]);
-            await execSafeCall(CTF_ADDRESS, data, `SNIPER redeemPositions ${label}`);
-            logger.money(`SNIPER redeemer: redeemed ${label} → ~$${expectedUsdc.toFixed(2)} USDC ✅`);
+            await execSafeCall(CTF_ADDRESS, data, `redeemPositions ${label}`);
+
+            if (isWin) {
+                logger.money(`SNIPER redeemer: redeemed ${label} → ~$${expectedUsdc.toFixed(2)} USDC ✅`);
+            } else {
+                logger.info(`SNIPER redeemer: burned ${label} tokens (loss cleared)`);
+            }
             redeemed++;
         } catch (err) {
-            logger.error(`SNIPER redeemer: failed to redeem ${conditionId.slice(0, 12)}... — ${parseOnchainError(err)}`);
+            const friendly = parseOnchainError(err);
+            logger.error(`SNIPER redeemer: failed ${conditionId.slice(0, 12)}... — ${friendly}`);
+            // Don't retry this conditionId next cycle — it will keep failing
+            _failedConditions.add(conditionId);
+            logger.warn(`SNIPER redeemer: skipping ${conditionId.slice(0, 12)}... in future cycles`);
         }
     }
 
     if (redeemed > 0) {
-        logger.success(`SNIPER redeemer: collected ${redeemed} winning position(s)`);
+        logger.success(`SNIPER redeemer: processed ${redeemed} position(s)`);
     }
 }
