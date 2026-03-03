@@ -70,10 +70,13 @@ async function buildStatusContent() {
     lines.push('');
 
     lines.push('{bold}SNIPER CONFIG{/bold}');
+    const prices = config.sniperTierPrices;
+    const sizes = [Math.floor(config.sniperMaxShares * 0.20), Math.floor(config.sniperMaxShares * 0.30), Math.floor(config.sniperMaxShares * 0.50)];
     lines.push(`  Assets : ${config.sniperAssets.join(', ').toUpperCase()}`);
-    lines.push(`  Price  : $${config.sniperPrice} per share`);
-    lines.push(`  Shares : ${config.sniperShares} per side`);
-    lines.push(`  Cost   : $${(config.sniperPrice * config.sniperShares * 2 * config.sniperAssets.length).toFixed(3)} per slot`);
+    lines.push(`  3-Tier : ${prices[0]}c/${prices[1]}c/${prices[2]}c`);
+    lines.push(`  Sizes  : ${sizes[0]}/${sizes[1]}/${sizes[2]} shares`);
+    const costPerSide = (sizes[0] * prices[0]) + (sizes[1] * prices[1]) + (sizes[2] * prices[2]);
+    lines.push(`  Cost   : $${(costPerSide * 2 * config.sniperAssets.length).toFixed(3)} per slot`);
     lines.push('');
 
     // Session schedule

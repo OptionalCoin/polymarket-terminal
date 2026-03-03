@@ -164,7 +164,8 @@ export function startSniperDetector(onNewMarket) {
     const secsUntil = ns - Math.floor(Date.now() / 1000);
     logger.info(`SNIPER detector started — assets: ${config.sniperAssets.join(', ').toUpperCase()}`);
     logger.info(`Next slot: *-updown-5m-${ns} (opens in ${secsUntil}s)`);
-    logger.info(`Order: $${config.sniperPrice} × ${config.sniperShares} shares per side`);
+    const prices = config.sniperTierPrices;
+    logger.info(`Order: 3-tier ${prices[0]}c/${prices[1]}c/${prices[2]}c (max ${config.sniperMaxShares} shares per side)`);
 }
 
 export function stopSniperDetector() {
